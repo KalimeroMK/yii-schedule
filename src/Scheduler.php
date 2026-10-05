@@ -33,7 +33,6 @@ final class Scheduler
     /** @var array<string, TaskGenerator> */
     private array $generators = [];
     private bool $shouldStop = false;
-    private readonly ?EventDispatcherInterface $dispatcher;
     private readonly LoggerInterface $logger;
 
     /**
@@ -43,10 +42,9 @@ final class Scheduler
         iterable $schedules,
         private readonly TaskHandlerInterface $handler,
         private readonly ClockInterface $clock,
-        ?EventDispatcherInterface $dispatcher = null,
+        private readonly ?EventDispatcherInterface $dispatcher = null,
         ?LoggerInterface $logger = null,
     ) {
-        $this->dispatcher = $dispatcher;
         $this->logger = $logger ?? new NullLogger();
 
         foreach ($schedules as $schedule) {

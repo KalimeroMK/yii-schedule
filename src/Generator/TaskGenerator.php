@@ -27,7 +27,7 @@ final class TaskGenerator
 {
     private ?TriggerHeap $heap = null;
     private int $heapRevision = -1;
-    private Checkpoint $checkpoint;
+    private readonly Checkpoint $checkpoint;
     /** @var array<string, int> Task id to insertion index. */
     private array $indices = [];
 
@@ -138,7 +138,7 @@ final class TaskGenerator
         // Probe one microsecond before the checkpoint so runs due exactly at the checkpoint time
         // are re-emitted and filtered by their index: only the unprocessed remainder survives.
         // An idle-tick marker (index -1) has no such remainder, so it seeds strictly after itself.
-        $seedTime = null === $lastTime ? $this->clock->now() : $lastTime;
+        $seedTime = $lastTime ?? $this->clock->now();
         if (null !== $lastTime && $this->checkpoint->index() >= 0) {
             $seedTime = $lastTime->modify('-1 microsecond');
         }
