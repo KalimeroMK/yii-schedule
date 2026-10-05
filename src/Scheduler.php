@@ -106,7 +106,7 @@ final class Scheduler
             $sleep = max(0.0, $sleepSeconds - $elapsed);
 
             if ($sleep > 0) {
-                usleep((int) ($sleep * 1_000_000));
+                usleep(max(0, (int) ($sleep * 1_000_000)));
             }
         }
     }

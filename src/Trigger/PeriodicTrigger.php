@@ -92,7 +92,7 @@ final class PeriodicTrigger implements TriggerInterface
             $next = (new DateTimeImmutable())->setTimestamp($next)->setTimezone($lastRun->getTimezone());
 
             if ($next <= $lastRun) {
-                $next = $next->modify(sprintf('+%d seconds', $this->seconds));
+                $next = $next->setTimestamp($next->getTimestamp() + $this->seconds);
             }
         } else {
             $next = $this->firstMultipleAfter($this->from, $lastRun);
