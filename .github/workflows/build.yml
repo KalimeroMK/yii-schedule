@@ -44,4 +44,4 @@ jobs:
         uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
 
       - name: Run tests
-        run: vendor/bin/phpunit --colors=always
+        run: vendor/bin/phpunit --colors=always --display-warnings --display-deprecations
