@@ -13,6 +13,15 @@ use Psr\SimpleCache\CacheInterface;
 final class InMemoryCache implements CacheInterface
 {
     private array $values = [];
+    private bool $writesFail = false;
+
+    /**
+     * Makes every subsequent write report a failure, as a full or unavailable cache would.
+     */
+    public function failWrites(): void
+    {
+        $this->writesFail = true;
+    }
 
     public function get(string $key, mixed $default = null): mixed
     {
@@ -21,6 +30,10 @@ final class InMemoryCache implements CacheInterface
 
     public function set(string $key, mixed $value, DateInterval|int|null $ttl = null): bool
     {
+        if ($this->writesFail) {
+            return false;
+        }
+
         $this->values[$key] = $value;
 
         return true;

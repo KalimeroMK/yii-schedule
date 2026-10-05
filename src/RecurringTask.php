@@ -7,6 +7,7 @@ namespace Yiisoft\Schedule;
 use Closure;
 use DateInterval;
 use ReflectionFunction;
+use Throwable;
 use Yiisoft\Schedule\Trigger\CronExpressionTrigger;
 use Yiisoft\Schedule\Trigger\PeriodicTrigger;
 use Yiisoft\Schedule\Trigger\TriggerInterface;
@@ -49,10 +50,7 @@ final class RecurringTask
     public static function every(int|string|DateInterval $interval, callable|object|string $task): self
     {
         if (is_string($interval)) {
-            $interval = DateInterval::createFromDateString($interval);
-            if (false === $interval) {
-                throw new Exception\LogicException('The interval string could not be parsed.');
-            }
+            $interval = self::parseInterval($interval);
         }
 
         $trigger = new PeriodicTrigger($interval);
@@ -84,6 +82,25 @@ final class RecurringTask
     public function getTask(): mixed
     {
         return $this->task;
+    }
+
+    /**
+     * PHP 8.3 and later throw on a malformed interval string, earlier versions return false;
+     * both are reported as the same package-level exception.
+     */
+    private static function parseInterval(string $interval): DateInterval
+    {
+        try {
+            $parsed = DateInterval::createFromDateString($interval);
+        } catch (Throwable $e) {
+            throw new Exception\LogicException('The interval string could not be parsed.', 0, $e);
+        }
+
+        if (!$parsed instanceof DateInterval) {
+            throw new Exception\LogicException('The interval string could not be parsed.');
+        }
+
+        return $parsed;
     }
 
     /**

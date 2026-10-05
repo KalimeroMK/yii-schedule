@@ -339,4 +339,205 @@ final class SchedulerTest extends TestCase
 
         $this->assertSame(3, $ran);
     }
+
+    public function testTasksSharingADueTimeAreNotReRunAfterARestart(): void
+    {
+        $cache = new InMemoryCache();
+        $clock = new TestClock();
+        $ran = [];
+
+        $buildScheduler = static function () use ($cache, $clock, &$ran): Scheduler {
+            $schedule = (new Schedule())
+                ->stateful($cache)
+                ->task(
+                    RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                        $ran[] = 'A';
+                    }),
+                    RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                        $ran[] = 'B';
+                    }),
+                    RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                        $ran[] = 'C';
+                    }),
+                );
+
+            return new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+        };
+
+        $buildScheduler()->tick();
+
+        $clock->advance('+1 minute');
+        $buildScheduler()->tick();
+
+        // A fresh process with nothing newly due must not replay the runs of the shared due time.
+        $this->assertSame(0, $buildScheduler()->tick());
+        $this->assertSame(['A', 'B', 'C'], $ran);
+    }
+
+    public function testStandbyProcessDoesNotReplayRunsHandledByTheLockHolder(): void
+    {
+        $cache = new InMemoryCache();
+        $mutex = new InMemoryMutex();
+        $clock = new TestClock();
+        $ran = 0;
+
+        $buildScheduler = static function () use ($cache, $mutex, $clock, &$ran): Scheduler {
+            $schedule = (new Schedule())
+                ->stateful($cache)
+                ->lock($mutex)
+                ->task(
+                    RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                        ++$ran;
+                    }),
+                );
+
+            return new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+        };
+
+        $primary = $buildScheduler();
+        $standby = $buildScheduler();
+
+        $primary->tick();
+        $standby->tick();
+
+        // The primary wins the mutex for four minutes in a row.
+        for ($minute = 0; $minute < 4; ++$minute) {
+            $clock->advance('+1 minute');
+            $primary->tick();
+        }
+
+        $this->assertSame(4, $ran);
+
+        // The standby takes over: only the newly due minute is its to run.
+        $clock->advance('+1 minute');
+
+        $this->assertSame(1, $standby->tick());
+        $this->assertSame(5, $ran);
+    }
+
+    public function testTaskFailureIsNotMaskedByACheckpointPersistenceFailure(): void
+    {
+        $cache = new InMemoryCache();
+        $clock = new TestClock();
+
+        $schedule = (new Schedule())
+            ->stateful($cache)
+            ->task(
+                RecurringTask::cron('* * * * *', static function (): void {
+                    throw new RuntimeException('Task failed.');
+                }),
+            );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+        $cache->failWrites();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Task failed.');
+
+        $scheduler->tick();
+    }
+
+    public function testDuplicateScheduleNameIsRejected(): void
+    {
+        $clock = new TestClock();
+
+        $first = (new Schedule())->task(RecurringTask::cron('* * * * *', 'app:first'));
+        $second = (new Schedule())->task(RecurringTask::cron('* * * * *', 'app:second'));
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('default');
+
+        new Scheduler([$first, $second], new CallableTaskHandler(), $clock);
+    }
+
+    public function testSchedulesWithDistinctNamesAreBothKept(): void
+    {
+        $clock = new TestClock();
+        $ran = [];
+
+        $first = (new Schedule('first'))->task(
+            RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                $ran[] = 'first';
+            }),
+        );
+        $second = (new Schedule('second'))->task(
+            RecurringTask::cron('* * * * *', static function () use (&$ran): void {
+                $ran[] = 'second';
+            }),
+        );
+
+        $scheduler = new Scheduler([$first, $second], new CallableTaskHandler(), $clock);
+
+        $this->assertCount(2, $scheduler->getSchedules());
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+        $scheduler->tick();
+
+        $this->assertSame(['first', 'second'], $ran);
+    }
+
+    public function testCancelledRunSkipsTheScheduleListeners(): void
+    {
+        $clock = new TestClock();
+        $calls = [];
+
+        $schedule = (new Schedule())
+            ->before(static function () use (&$calls): void {
+                $calls[] = 'before';
+            })
+            ->after(static function () use (&$calls): void {
+                $calls[] = 'after';
+            })
+            ->task(
+                RecurringTask::cron('* * * * *', static fn(): null => null),
+            );
+
+        $dispatcher = new class implements EventDispatcherInterface {
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof PreRunEvent) {
+                    $event->cancel();
+                }
+
+                return $event;
+            }
+        };
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock, $dispatcher);
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+        $scheduler->tick();
+
+        $this->assertSame([], $calls);
+    }
+
+    public function testStopRequestedBeforeTheLoopStartsIsHonoured(): void
+    {
+        $clock = new TestClock();
+        $ran = 0;
+        $scheduler = null;
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use (&$ran, &$scheduler): void {
+                ++$ran;
+                $scheduler?->stop();
+            }),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+
+        // A signal handled between the handler registration and the loop must not be lost.
+        $scheduler->stop();
+        $scheduler->run(0.0);
+
+        $this->assertSame(0, $ran);
+    }
 }

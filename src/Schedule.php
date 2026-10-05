@@ -86,6 +86,17 @@ final class Schedule
     }
 
     /**
+     * Whether the schedule checkpoint is persisted.
+     *
+     * Only a stateful schedule can be driven by a command that exits between runs, such as a
+     * `schedule:run` cron entry: without a checkpoint a new process cannot tell what already ran.
+     */
+    public function isStateful(): bool
+    {
+        return null !== $this->state;
+    }
+
+    /**
      * When the process was down and several runs were missed, runs only the latest one.
      */
     public function processOnlyLastMissedRun(bool $onlyLast = true): static

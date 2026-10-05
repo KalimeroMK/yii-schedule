@@ -6,6 +6,7 @@ namespace Yiisoft\Schedule\Generator;
 
 use DateTimeImmutable;
 use Psr\Clock\ClockInterface;
+use Throwable;
 use Yiisoft\Schedule\Exception\LogicException;
 use Yiisoft\Schedule\RecurringTask;
 use Yiisoft\Schedule\Schedule;
@@ -25,6 +26,7 @@ use function count;
 final class TaskGenerator
 {
     private ?TriggerHeap $heap = null;
+    private int $heapRevision = -1;
     private Checkpoint $checkpoint;
     /** @var array<string, int> Task id to insertion index. */
     private array $indices = [];
@@ -50,7 +52,7 @@ final class TaskGenerator
     {
         $now = $this->clock->now();
 
-        if (!$this->checkpoint->acquire($now)) {
+        if (!$this->checkpoint->acquire()) {
             return;
         }
 
@@ -99,9 +101,18 @@ final class TaskGenerator
 
                 try {
                     yield $context => $task;
-                } finally {
-                    $this->checkpoint->save($time, $index);
+                } catch (Throwable $error) {
+                    // The task failing is the root cause; a checkpoint write failing on top of it
+                    // must not replace it. The next save reports the persistence failure anyway.
+                    try {
+                        $this->checkpoint->save($time, $index);
+                    } catch (Throwable) {
+                    }
+
+                    throw $error;
                 }
+
+                $this->checkpoint->save($time, $index);
             }
 
             if (!$emitted) {
@@ -114,10 +125,13 @@ final class TaskGenerator
 
     private function heap(): TriggerHeap
     {
-        if (null !== $this->heap) {
+        // A position read from the shared state replaces the pending runs: they were computed from
+        // a position this process believed to be current, and another one has moved on since.
+        if (null !== $this->heap && $this->heapRevision === $this->checkpoint->revision()) {
             return $this->heap;
         }
 
+        $this->heapRevision = $this->checkpoint->revision();
         $this->heap = new TriggerHeap();
         $lastTime = $this->checkpoint->time();
 

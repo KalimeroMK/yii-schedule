@@ -67,8 +67,14 @@ or as a daemon:
 php yii schedule:work
 ```
 
-For schedules that must survive restarts and compensate missed runs, make them stateful,
-and to prevent overlapping runs across processes, add a mutex:
+`schedule:run` exits between runs, so a persisted checkpoint is the only way for it to tell
+which runs already happened: it requires a stateful schedule and reports an error without one.
+The bundled configuration makes the schedule stateful automatically when the application has a
+PSR-16 cache. `schedule:work` keeps the position in memory and works either way, though a
+checkpoint also lets it compensate the runs missed while it was down.
+
+When building a schedule by hand, persist its checkpoint, and add a mutex to prevent
+overlapping runs across processes:
 
 ```php
 use Yiisoft\Schedule\Schedule;
