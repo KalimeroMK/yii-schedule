@@ -1,0 +1,28 @@
+name: backwards compatibility
+
+on:
+  pull_request:
+    paths: &paths
+      - 'src/**'
+      - 'config/**'
+      - 'composer.json'
+      - '.github/workflows/bc.yml'
+  push:
+    branches: ['master']
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  roave_bc_check:
+    uses: yiisoft/actions/.github/workflows/bc.yml@master
+    with:
+      os: >-
+        ['ubuntu-latest']
+      php: >-
+        ['8.5']
