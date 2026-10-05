@@ -28,6 +28,7 @@ final class Checkpoint
     private ?DateTimeImmutable $time = null;
     private int $index = -1;
     private bool $locked = false;
+    private int $revision = 0;
 
     public function __construct(
         private readonly string $scheduleName,
@@ -39,18 +40,30 @@ final class Checkpoint
 
     /**
      * Acquires the schedule mutex, if any. Returns false when another process holds it.
+     *
+     * The persisted position is re-read on every acquisition: another process may have advanced
+     * it while this one was standing by, and replaying its runs would run them twice.
      */
-    public function acquire(DateTimeImmutable $now): bool
+    public function acquire(): bool
     {
-        if (null === $this->mutex) {
-            return true;
+        if (null !== $this->mutex && !$this->mutex->acquire(0)) {
+            return false;
         }
 
-        if ($this->mutex->acquire(0)) {
-            return $this->locked = true;
-        }
+        $this->locked = null !== $this->mutex;
 
-        return false;
+        $this->load();
+
+        return true;
+    }
+
+    /**
+     * Changes whenever the position is replaced by one read from the shared state, so a caller
+     * caching work derived from the position knows to recompute it.
+     */
+    public function revision(): int
+    {
+        return $this->revision;
     }
 
     /**
@@ -76,9 +89,16 @@ final class Checkpoint
 
     /**
      * Marks a run as emitted.
+     *
+     * The position never moves backwards: runs re-discovered and skipped during a catch-up are
+     * reported here too, and lowering the position would make the ones after them look unemitted.
      */
     public function save(DateTimeImmutable $time, int $index): void
     {
+        if (null !== $this->time && ($time < $this->time || ($time == $this->time && $index <= $this->index))) {
+            return;
+        }
+
         $this->time = $time;
         $this->index = $index;
 
@@ -123,8 +143,17 @@ final class Checkpoint
             );
         }
 
-        $this->time = DateTimeImmutable::createFromFormat('U.u', (string) $state['time']) ?: null;
-        $this->index = $state['index'];
+        $time = DateTimeImmutable::createFromFormat('U.u', (string) $state['time']) ?: null;
+        $index = $state['index'];
+
+        if ($index === $this->index && $time == $this->time) {
+            return;
+        }
+
+        $this->time = $time;
+        $this->index = $index;
+
+        ++$this->revision;
     }
 
     private function persist(): void

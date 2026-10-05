@@ -12,12 +12,15 @@ use Throwable;
 use Yiisoft\Schedule\Event\FailureEvent;
 use Yiisoft\Schedule\Event\PostRunEvent;
 use Yiisoft\Schedule\Event\PreRunEvent;
+use Yiisoft\Schedule\Exception\LogicException;
 use Yiisoft\Schedule\Generator\TaskGenerator;
 use Yiisoft\Schedule\Handler\TaskHandlerInterface;
 
+use function array_key_exists;
 use function array_map;
 use function hrtime;
 use function max;
+use function sprintf;
 use function usleep;
 
 /**
@@ -30,7 +33,6 @@ final class Scheduler
     /** @var array<string, TaskGenerator> */
     private array $generators = [];
     private bool $shouldStop = false;
-    private readonly ?EventDispatcherInterface $dispatcher;
     private readonly LoggerInterface $logger;
 
     /**
@@ -40,14 +42,23 @@ final class Scheduler
         iterable $schedules,
         private readonly TaskHandlerInterface $handler,
         private readonly ClockInterface $clock,
-        ?EventDispatcherInterface $dispatcher = null,
+        private readonly ?EventDispatcherInterface $dispatcher = null,
         ?LoggerInterface $logger = null,
     ) {
-        $this->dispatcher = $dispatcher;
         $this->logger = $logger ?? new NullLogger();
 
         foreach ($schedules as $schedule) {
-            $this->generators[$schedule->getName()] = new TaskGenerator($schedule, $clock);
+            $name = $schedule->getName();
+
+            // Schedules are addressed by name, in the checkpoint cache key as well, so two of
+            // them sharing one would quietly discard a schedule and mix up their positions.
+            if (array_key_exists($name, $this->generators)) {
+                throw new LogicException(
+                    sprintf('A schedule named "%s" is already registered in the scheduler.', $name),
+                );
+            }
+
+            $this->generators[$name] = new TaskGenerator($schedule, $clock);
         }
     }
 
@@ -71,14 +82,15 @@ final class Scheduler
     /**
      * Runs the scheduler loop until stop() is called (e.g. from a signal handler).
      *
+     * A stop() requested before the loop starts, by a signal handler registered ahead of it,
+     * is honoured: the loop is not entered at all.
+     *
      * @param float $sleepSeconds The time to sleep between ticks when no task is due.
      *
      * @psalm-suppress RedundantCondition, TypeDoesNotContainType The flag is flipped by stop() from a signal handler.
      */
     public function run(float $sleepSeconds = 1.0): void
     {
-        $this->shouldStop = false;
-
         while (!$this->shouldStop) {
             $startedAt = hrtime(true);
 
@@ -92,7 +104,7 @@ final class Scheduler
             $sleep = max(0.0, $sleepSeconds - $elapsed);
 
             if ($sleep > 0) {
-                usleep((int) ($sleep * 1_000_000));
+                usleep(max(0, (int) ($sleep * 1_000_000)));
             }
         }
     }
@@ -119,14 +131,17 @@ final class Scheduler
 
         $preEvent = new PreRunEvent($context, $task);
         $this->dispatcher?->dispatch($preEvent);
-        foreach ($schedule->getBeforeListeners() as $listener) {
-            $listener($context, $task);
-        }
 
+        // Checked before the listeners run: a cancelled run has no after/onFailure counterpart,
+        // so whatever a before listener opens here would never be closed.
         if ($preEvent->isCancelled()) {
             $this->logger->info('Task {id} of schedule {schedule} was cancelled.', ['id' => $context->taskId, 'schedule' => $context->scheduleName]);
 
             return;
+        }
+
+        foreach ($schedule->getBeforeListeners() as $listener) {
+            $listener($context, $task);
         }
 
         try {

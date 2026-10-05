@@ -7,6 +7,7 @@ namespace Yiisoft\Schedule\Tests\Trigger;
 use DateInterval;
 use DateTimeImmutable;
 use PHPUnit\Framework\TestCase;
+use Yiisoft\Schedule\Exception\LogicException;
 use Yiisoft\Schedule\Trigger\PeriodicTrigger;
 
 final class PeriodicTriggerTest extends TestCase
@@ -52,5 +53,66 @@ final class PeriodicTriggerTest extends TestCase
         $lastRun = new DateTimeImmutable('2026-01-01 00:00:00+00:00');
 
         $this->assertSame('2026-01-02 00:00:00', $trigger->getNextRunDate($lastRun)->format('Y-m-d H:i:s'));
+    }
+
+    public function testDateIntervalDescriptionDistinguishesMonthsFromYears(): void
+    {
+        $this->assertSame('every(P1M)', (string) new PeriodicTrigger(new DateInterval('P1M')));
+        $this->assertSame('every(P2M)', (string) new PeriodicTrigger(new DateInterval('P2M')));
+        $this->assertSame('every(P1Y)', (string) new PeriodicTrigger(new DateInterval('P1Y')));
+    }
+
+    public function testDateIntervalDescriptionKeepsSubSecondPrecision(): void
+    {
+        $interval = DateInterval::createFromDateString('500 microseconds');
+
+        $this->assertSame('every(PT0.0005S)', (string) new PeriodicTrigger($interval));
+    }
+
+    public function testDateIntervalDescriptionOfAZeroInterval(): void
+    {
+        $this->assertSame('every(P0D)', (string) new PeriodicTrigger(new DateInterval('PT0S')));
+    }
+
+    public function testShortDateIntervalFarPastTheAnchor(): void
+    {
+        $from = new DateTimeImmutable('2026-01-01 00:00:00+00:00');
+        $trigger = new PeriodicTrigger(new DateInterval('PT1S'), $from);
+
+        // Four hours past the anchor is more than 10000 one-second steps away.
+        $lastRun = new DateTimeImmutable('2026-01-01 04:00:00+00:00');
+
+        $this->assertSame('2026-01-01 04:00:01', $trigger->getNextRunDate($lastRun)->format('Y-m-d H:i:s'));
+    }
+
+    public function testCalendarDateIntervalStaysAnchored(): void
+    {
+        $from = new DateTimeImmutable('2026-01-01 00:00:00+00:00');
+        $trigger = new PeriodicTrigger(new DateInterval('P1M'), $from);
+
+        $lastRun = new DateTimeImmutable('2026-06-15 00:00:00+00:00');
+
+        $this->assertSame('2026-07-01 00:00:00', $trigger->getNextRunDate($lastRun)->format('Y-m-d H:i:s'));
+    }
+
+    public function testDateIntervalBeforeTheAnchorRunsAtTheFirstMultiple(): void
+    {
+        $from = new DateTimeImmutable('2026-01-01 00:00:00+00:00');
+        $trigger = new PeriodicTrigger(new DateInterval('P1M'), $from);
+
+        $lastRun = new DateTimeImmutable('2025-12-01 00:00:00+00:00');
+
+        $this->assertSame('2026-01-01 00:00:00', $trigger->getNextRunDate($lastRun)->format('Y-m-d H:i:s'));
+    }
+
+    public function testNonAdvancingDateIntervalIsRejected(): void
+    {
+        $from = new DateTimeImmutable('2026-01-01 00:00:00+00:00');
+        $trigger = new PeriodicTrigger(new DateInterval('PT0S'), $from);
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The interval does not advance the date');
+
+        $trigger->getNextRunDate(new DateTimeImmutable('2026-01-01 01:00:00+00:00'));
     }
 }

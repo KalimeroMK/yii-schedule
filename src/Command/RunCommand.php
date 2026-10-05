@@ -11,6 +11,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 use Throwable;
 use Yiisoft\Schedule\Scheduler;
 
+use function implode;
 use function sprintf;
 
 /**
@@ -28,6 +29,27 @@ final class RunCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
+        $stateless = [];
+
+        foreach ($this->scheduler->getSchedules() as $schedule) {
+            if (!$schedule->isStateful()) {
+                $stateless[] = $schedule->getName();
+            }
+        }
+
+        // This command exits between runs, so it only knows what already ran from a checkpoint.
+        // Without one every invocation starts from scratch and nothing is ever due.
+        if ([] !== $stateless) {
+            $output->writeln(sprintf(
+                '<error>Schedule "%s" has no persisted checkpoint, so no run can ever be detected as due. '
+                . 'Make it stateful with Schedule::stateful($cache), or run the scheduler as a daemon '
+                . 'with schedule:work.</error>',
+                implode('", "', $stateless),
+            ));
+
+            return Command::FAILURE;
+        }
+
         try {
             $count = $this->scheduler->tick();
         } catch (Throwable $e) {
