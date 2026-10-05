@@ -185,7 +185,8 @@ final class PeriodicTrigger implements TriggerInterface
     private function add(DateTimeImmutable $date): DateTimeImmutable
     {
         if (null !== $this->seconds) {
-            return $date->modify(sprintf('+%d seconds', $this->seconds));
+            // setTimestamp() is used instead of modify(): the latter may return false on older PHP versions.
+            return $date->setTimestamp($date->getTimestamp() + $this->seconds);
         }
 
         /** @var DateInterval $interval */
