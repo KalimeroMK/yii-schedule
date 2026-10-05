@@ -85,13 +85,15 @@ final class RecurringTask
     }
 
     /**
-     * PHP 8.3 and later throw on a malformed interval string, earlier versions return false;
-     * both are reported as the same package-level exception.
+     * PHP 8.3 and later throw on a malformed interval string, earlier versions emit a warning
+     * and return false; both are reported as the same package-level exception.
      */
     private static function parseInterval(string $interval): DateInterval
     {
         try {
-            $parsed = DateInterval::createFromDateString($interval);
+            // The suppression operator silences the warning emitted on PHP 8.1 and 8.2;
+            // the false result is handled right below.
+            $parsed = @DateInterval::createFromDateString($interval);
         } catch (Throwable $e) {
             throw new Exception\LogicException('The interval string could not be parsed.', 0, $e);
         }
