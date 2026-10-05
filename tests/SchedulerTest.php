@@ -263,7 +263,7 @@ final class SchedulerTest extends TestCase
                 $calls[] = 'after';
             })
             ->task(
-                RecurringTask::cron('* * * * *', static fn(): null => null),
+                RecurringTask::cron('* * * * *', static fn() => null),
             );
 
         $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
@@ -493,7 +493,7 @@ final class SchedulerTest extends TestCase
                 $calls[] = 'after';
             })
             ->task(
-                RecurringTask::cron('* * * * *', static fn(): null => null),
+                RecurringTask::cron('* * * * *', static fn() => null),
             );
 
         $dispatcher = new class implements EventDispatcherInterface {
