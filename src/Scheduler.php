@@ -33,7 +33,6 @@ use function min;
 use function ob_end_clean;
 use function ob_get_level;
 use function sprintf;
-use function time_nanosleep;
 use function usleep;
 
 use const SIGCHLD;
@@ -353,21 +352,21 @@ final class Scheduler
     /**
      * Sleeps for the given seconds, returning early when a signal interrupts the wait.
      *
-     * time_nanosleep() is only compiled in where nanosleep() exists, so Windows needs the
-     * coarser usleep() - which is no loss there, as it has no signals to wake up for either.
+     * usleep() is interrupted by a signal just like time_nanosleep(), and unlike it is
+     * available everywhere: time_nanosleep() is only compiled in where nanosleep() is, which
+     * leaves out Windows. Microsecond resolution is finer than any schedule needs.
      */
     private static function waitFor(float $seconds): void
     {
-        if (function_exists('time_nanosleep')) {
-            $wholeSeconds = (int) $seconds;
-            $nanoseconds = (int) (($seconds - $wholeSeconds) * 1_000_000_000);
+        $microseconds = (int) ($seconds * 1_000_000);
 
-            time_nanosleep($wholeSeconds, $nanoseconds);
-
+        // A remainder below a microsecond is not worth the syscall; the caller's deadline
+        // check ends the wait right after this anyway.
+        if ($microseconds < 1) {
             return;
         }
 
-        usleep((int) ($seconds * 1_000_000));
+        usleep($microseconds);
     }
 
     private function runTask(RecurringTask $task, TaskContext $context): void
