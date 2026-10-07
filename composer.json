@@ -49,7 +49,8 @@
     "suggest": {
         "yiisoft/mutex": "To prevent overlapping runs across processes.",
         "yiisoft/queue": "To push due tasks to a queue instead of running them in the scheduler process.",
-        "ext-pcntl": "To handle signals in the schedule:work command."
+        "ext-pcntl": "To handle signals and run due tasks in parallel in the schedule:work command.",
+        "ext-posix": "To stop forked task processes gracefully when schedule:work shuts down."
     },
     "autoload": {
         "psr-4": {

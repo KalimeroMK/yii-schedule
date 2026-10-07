@@ -123,6 +123,28 @@ final class TaskGenerator
         }
     }
 
+    /**
+     * The soonest pending run of the schedule, if any.
+     *
+     * The daemon loop sleeps until this date instead of polling on a fixed interval. When the
+     * schedule mutex is held by another process, null is returned: that process is the one
+     * driving the schedule, so there is nothing here to wake up for.
+     */
+    public function getNextRunDate(): ?DateTimeImmutable
+    {
+        if (!$this->checkpoint->acquire()) {
+            return null;
+        }
+
+        try {
+            $heap = $this->heap();
+
+            return $heap->isEmpty() ? null : $heap->top()[0];
+        } finally {
+            $this->checkpoint->release();
+        }
+    }
+
     private function heap(): TriggerHeap
     {
         // A position read from the shared state replaces the pending runs: they were computed from

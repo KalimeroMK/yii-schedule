@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Yiisoft\Schedule\Tests;
 
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use Yiisoft\Schedule\Event\FailureEvent;
 use Yiisoft\Schedule\Event\PostRunEvent;
@@ -539,5 +540,175 @@ final class SchedulerTest extends TestCase
         $scheduler->run(0.0);
 
         $this->assertSame(0, $ran);
+    }
+
+    public function testNextRunDateIsNullWithoutTasks(): void
+    {
+        $scheduler = new Scheduler([new Schedule()], new CallableTaskHandler(), new TestClock());
+
+        $this->assertNull($scheduler->nextRunDate());
+    }
+
+    public function testNextRunDateReflectsTheSoonestPendingRun(): void
+    {
+        $clock = new TestClock();
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static fn() => null),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        $this->assertSame('2026-01-01 00:01:00', $scheduler->nextRunDate()?->format('Y-m-d H:i:s'));
+
+        $clock->advance('+1 minute');
+        $scheduler->tick();
+
+        $this->assertSame('2026-01-01 00:02:00', $scheduler->nextRunDate()?->format('Y-m-d H:i:s'));
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testConcurrentTickRunsDueTasksInParallel(): void
+    {
+        $clock = new TestClock();
+        $dir = sys_get_temp_dir() . '/yii-schedule-test-' . uniqid();
+        mkdir($dir);
+
+        // Each task waits for the other to have started; run one after another,
+        // the first would time out waiting for the second.
+        $waitForPeer = static function (string $own, string $peer) use ($dir): void {
+            file_put_contents("$dir/$own.pid", (string) getmypid());
+
+            $deadline = microtime(true) + 10;
+
+            while (!file_exists("$dir/$peer.pid")) {
+                if (microtime(true) > $deadline) {
+                    file_put_contents("$dir/$own.timeout", '1');
+
+                    return;
+                }
+
+                usleep(10_000);
+            }
+        };
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use ($waitForPeer): void {
+                $waitForPeer('a', 'b');
+            }),
+            RecurringTask::cron('* * * * *', static function () use ($waitForPeer): void {
+                $waitForPeer('b', 'a');
+            }),
+        );
+
+        $dispatcher = new class implements EventDispatcherInterface {
+            public array $results = [];
+
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof PostRunEvent) {
+                    $this->results[] = $event->result;
+                }
+
+                return $event;
+            }
+        };
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock, $dispatcher);
+
+        try {
+            $scheduler->tick();
+            $clock->advance('+1 minute');
+
+            $this->assertSame(2, $scheduler->tick(true));
+
+            $deadline = microtime(true) + 15;
+            while ($scheduler->hasRunningChildren() && microtime(true) < $deadline) {
+                $scheduler->reapChildren();
+                usleep(10_000);
+            }
+
+            $pidA = file_exists("$dir/a.pid") ? (int) file_get_contents("$dir/a.pid") : null;
+            $pidB = file_exists("$dir/b.pid") ? (int) file_get_contents("$dir/b.pid") : null;
+
+            $this->assertNotNull($pidA);
+            $this->assertNotNull($pidB);
+            $this->assertNotSame($pidA, $pidB);
+            $this->assertNotSame(getmypid(), $pidA);
+            $this->assertNotSame(getmypid(), $pidB);
+            $this->assertFileDoesNotExist("$dir/a.timeout");
+            $this->assertFileDoesNotExist("$dir/b.timeout");
+
+            // The result cannot cross the process boundary, so the events carry null.
+            $this->assertSame([null, null], $dispatcher->results);
+        } finally {
+            array_map('unlink', glob("$dir/*") ?: []);
+            rmdir($dir);
+        }
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testConcurrentTickReportsChildFailure(): void
+    {
+        $clock = new TestClock();
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function (): void {
+                throw new RuntimeException('Task failed.');
+            }),
+        );
+
+        $dispatcher = new class implements EventDispatcherInterface {
+            public array $failures = [];
+
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof FailureEvent) {
+                    $this->failures[] = $event->error->getMessage();
+                    $event->ignore();
+                }
+
+                return $event;
+            }
+        };
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock, $dispatcher);
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+        $scheduler->tick(true);
+
+        while ($scheduler->hasRunningChildren()) {
+            $scheduler->reapChildren();
+            usleep(10_000);
+        }
+
+        $this->assertSame(['The task process exited with code 1.'], $dispatcher->failures);
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testConcurrentTickThrowsUnignoredChildFailure(): void
+    {
+        $clock = new TestClock();
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function (): void {
+                throw new RuntimeException('Task failed.');
+            }),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        $scheduler->tick();
+        $clock->advance('+1 minute');
+        $scheduler->tick(true);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('The task process exited with code 1.');
+
+        while ($scheduler->hasRunningChildren()) {
+            $scheduler->reapChildren();
+            usleep(10_000);
+        }
     }
 }

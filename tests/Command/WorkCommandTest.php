@@ -39,8 +39,10 @@ final class WorkCommandTest extends TestCase
 
     public function testValidSleepRunsUntilStopped(): void
     {
+        // Sequential, because the task stops the loop through a shared reference; a forked
+        // child would stop only its own copy of the scheduler.
         $tester = new CommandTester(new WorkCommand($this->selfStoppingScheduler()));
-        $exitCode = $tester->execute(['--sleep' => '0.01']);
+        $exitCode = $tester->execute(['--sleep' => '0.01', '--sequential' => true]);
 
         $this->assertSame(Command::SUCCESS, $exitCode);
         $this->assertStringContainsString('Scheduler stopped.', $tester->getDisplay());

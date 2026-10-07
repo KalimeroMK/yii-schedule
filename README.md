@@ -67,6 +67,19 @@ or as a daemon:
 php yii schedule:work
 ```
 
+The daemon sleeps until the next scheduled run instead of polling on a fixed interval, and
+(with `ext-pcntl`) forks a child process per due task, so tasks sharing a due time run in
+parallel instead of blocking one another. Pass `--sequential` to run due tasks one after
+another as before.
+
+Two things to know about the forked mode:
+
+- a task's return value cannot cross the process boundary, so `PostRunEvent` and the `after`
+  listeners receive `null` as the result; a failure is reported as the child's exit status;
+- a child inherits the parent's open connections and sockets, so a task that talks to a
+  database or similar should acquire its own connection rather than reuse one opened before
+  the fork — or push the work to the queue, which is fast enough to do in the parent.
+
 `schedule:run` exits between runs, so a persisted checkpoint is the only way for it to tell
 which runs already happened: it requires a stateful schedule and reports an error without one.
 The bundled configuration makes the schedule stateful automatically when the application has a

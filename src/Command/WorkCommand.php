@@ -18,11 +18,14 @@ use function is_numeric;
 use function is_scalar;
 use function sprintf;
 
+use const SIGCHLD;
 use const SIGINT;
 use const SIGTERM;
 
 /**
- * Runs the scheduler as a daemon, evaluating the schedules about once per second.
+ * Runs the scheduler as a daemon, sleeping until the next scheduled run instead of polling
+ * on a fixed interval. With ext-pcntl, each due task runs in its own forked process, so
+ * tasks sharing a due time start together instead of blocking one another.
  */
 #[AsCommand('schedule:work', 'Runs the scheduler as a long-running process.')]
 final class WorkCommand extends Command implements SignalableCommandInterface
@@ -39,18 +42,31 @@ final class WorkCommand extends Command implements SignalableCommandInterface
             'sleep',
             's',
             InputOption::VALUE_REQUIRED,
-            'The seconds to sleep between ticks when no task is due.',
+            'The seconds to sleep when no task has a pending run.',
             1,
+        );
+        $this->addOption(
+            'sequential',
+            null,
+            InputOption::VALUE_NONE,
+            'Run due tasks one after another instead of forking a process per task.',
         );
     }
 
     public function getSubscribedSignals(): array
     {
-        return extension_loaded('pcntl') ? [SIGTERM, SIGINT] : [];
+        return extension_loaded('pcntl') ? [SIGTERM, SIGINT, SIGCHLD] : [];
     }
 
     public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
     {
+        if (SIGCHLD === $signal) {
+            // A task process finished; collect its outcome without leaving the loop.
+            $this->scheduler->reapChildren();
+
+            return false;
+        }
+
         $this->scheduler->stop();
 
         return false;
@@ -74,7 +90,7 @@ final class WorkCommand extends Command implements SignalableCommandInterface
 
         $output->writeln('<info>Scheduler started.</info>');
 
-        $this->scheduler->run((float) $sleep);
+        $this->scheduler->run((float) $sleep, !(bool) $input->getOption('sequential'));
 
         $output->writeln('<info>Scheduler stopped.</info>');
 
