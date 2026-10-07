@@ -814,7 +814,7 @@ final class SchedulerTest extends TestCase
         // that handler and quietly ignore the stop request a shutdown sends it.
         $asyncSignals = pcntl_async_signals();
         pcntl_async_signals(true);
-        pcntl_signal(SIGTERM, static fn(): null => null);
+        pcntl_signal(SIGTERM, static function (): void {});
 
         try {
             $scheduler->tick();
