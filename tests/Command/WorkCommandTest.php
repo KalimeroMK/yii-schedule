@@ -37,6 +37,40 @@ final class WorkCommandTest extends TestCase
         ];
     }
 
+    #[DataProvider('invalidMaxProcessesProvider')]
+    public function testInvalidMaxProcessesIsRejected(string $maxProcesses): void
+    {
+        $tester = new CommandTester(new WorkCommand($this->selfStoppingScheduler()));
+        $exitCode = $tester->execute(['--max-processes' => $maxProcesses]);
+
+        $this->assertSame(Command::INVALID, $exitCode);
+        $this->assertStringContainsString('--max-processes', $tester->getDisplay());
+    }
+
+    public static function invalidMaxProcessesProvider(): array
+    {
+        return [
+            'not a number' => ['abc'],
+            'zero' => ['0'],
+            'negative' => ['-1'],
+            'fractional' => ['1.5'],
+            'empty' => [''],
+        ];
+    }
+
+    public function testValidMaxProcessesIsAccepted(): void
+    {
+        $tester = new CommandTester(new WorkCommand($this->selfStoppingScheduler()));
+        $exitCode = $tester->execute([
+            '--sleep' => '0.01',
+            '--sequential' => true,
+            '--max-processes' => '2',
+        ]);
+
+        $this->assertSame(Command::SUCCESS, $exitCode);
+        $this->assertStringContainsString('Scheduler stopped.', $tester->getDisplay());
+    }
+
     public function testValidSleepRunsUntilStopped(): void
     {
         // Sequential, because the task stops the loop through a shared reference; a forked

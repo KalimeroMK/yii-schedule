@@ -26,7 +26,8 @@ use const SIGTERM;
 /**
  * Runs the scheduler as a daemon, sleeping until the next scheduled run instead of polling
  * on a fixed interval. With ext-pcntl, each due task runs in its own forked process, so
- * tasks sharing a due time start together instead of blocking one another.
+ * tasks sharing a due time start together instead of blocking one another, up to the limit
+ * --max-processes sets.
  */
 #[AsCommand('schedule:work', 'Runs the scheduler as a long-running process.')]
 final class WorkCommand extends Command implements SignalableCommandInterface
@@ -56,6 +57,12 @@ final class WorkCommand extends Command implements SignalableCommandInterface
             null,
             InputOption::VALUE_NONE,
             'Run due tasks one after another instead of forking a process per task.',
+        );
+        $this->addOption(
+            'max-processes',
+            null,
+            InputOption::VALUE_REQUIRED,
+            'The most task processes to run at once. Unlimited by default.',
         );
     }
 
@@ -102,9 +109,27 @@ final class WorkCommand extends Command implements SignalableCommandInterface
             return Command::INVALID;
         }
 
+        /** @var mixed $maxProcesses */
+        $maxProcesses = $input->getOption('max-processes');
+
+        // A fractional or non-positive limit would round down to a count no task fits in,
+        // leaving the loop waiting for a slot that never frees.
+        if (null !== $maxProcesses && (!is_numeric($maxProcesses) || (float) $maxProcesses < 1 || (float) (int) $maxProcesses !== (float) $maxProcesses)) {
+            $output->writeln(sprintf(
+                '<error>The --max-processes option must be a whole number greater than zero, "%s" given.</error>',
+                is_scalar($maxProcesses) ? (string) $maxProcesses : get_debug_type($maxProcesses),
+            ));
+
+            return Command::INVALID;
+        }
+
         $output->writeln('<info>Scheduler started.</info>');
 
-        $this->scheduler->run((float) $sleep, !(bool) $input->getOption('sequential'));
+        $this->scheduler->run(
+            (float) $sleep,
+            !(bool) $input->getOption('sequential'),
+            null === $maxProcesses ? null : (int) $maxProcesses,
+        );
 
         if (null !== $this->failure) {
             throw $this->failure;

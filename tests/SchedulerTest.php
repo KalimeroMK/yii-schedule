@@ -853,4 +853,115 @@ final class SchedulerTest extends TestCase
             rmdir($dir);
         }
     }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testConcurrentTickKeepsToTheProcessLimit(): void
+    {
+        $clock = new TestClock();
+        $dir = sys_get_temp_dir() . '/yii-schedule-test-' . uniqid();
+        mkdir($dir);
+
+        // Each run brackets itself in the log, so two running at once would interleave.
+        $record = static function (string $marker) use ($dir): void {
+            file_put_contents("$dir/order", $marker . "\n", FILE_APPEND | LOCK_EX);
+        };
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use ($record): void {
+                $record('start a');
+                usleep(100_000);
+                $record('end a');
+            }),
+            RecurringTask::cron('* * * * *', static function () use ($record): void {
+                $record('start b');
+                usleep(100_000);
+                $record('end b');
+            }),
+            RecurringTask::cron('* * * * *', static function () use ($record): void {
+                $record('start c');
+                usleep(100_000);
+                $record('end c');
+            }),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        try {
+            $scheduler->tick();
+            $clock->advance('+1 minute');
+            $scheduler->tick(true, 1);
+
+            $deadline = microtime(true) + 15;
+            while ($scheduler->hasRunningChildren() && microtime(true) < $deadline) {
+                $scheduler->reapChildren();
+                usleep(10_000);
+            }
+
+            $this->assertFalse($scheduler->hasRunningChildren());
+
+            $order = file("$dir/order", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            $this->assertCount(6, $order);
+
+            // Every run has ended before the next one starts, whatever order they came in.
+            foreach ([0, 2, 4] as $index) {
+                $this->assertStringStartsWith('start ', $order[$index]);
+                $this->assertSame('end ' . substr($order[$index], 6), $order[$index + 1]);
+            }
+        } finally {
+            array_map('unlink', glob("$dir/*") ?: []);
+            rmdir($dir);
+        }
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testForkedTaskDoesNotRunTheParentsShutdownSequence(): void
+    {
+        $clock = new TestClock();
+        $marker = sys_get_temp_dir() . '/yii-schedule-teardown-' . uniqid();
+
+        // Stands in for whatever the daemon holds open across the fork - a connection, say,
+        // whose destructor would say goodbye to the server the parent is still talking to.
+        $shared = new class ($marker) {
+            public function __construct(private readonly string $path) {}
+
+            public function __destruct()
+            {
+                file_put_contents($this->path, "destructed\n", FILE_APPEND);
+            }
+        };
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use ($shared): void {
+                // Only to carry the object across the fork.
+                unset($shared);
+            }),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        try {
+            $scheduler->tick();
+            $clock->advance('+1 minute');
+            $scheduler->tick(true);
+
+            $deadline = microtime(true) + 15;
+            while ($scheduler->hasRunningChildren() && microtime(true) < $deadline) {
+                $scheduler->reapChildren();
+                usleep(10_000);
+            }
+
+            $this->assertFalse($scheduler->hasRunningChildren());
+            $this->assertFileDoesNotExist($marker);
+
+            // It does run where it belongs, in the process that owns the object - which is
+            // what makes the check above more than a statement about this destructor.
+            unset($scheduler, $schedule, $shared);
+
+            $this->assertFileExists($marker);
+        } finally {
+            if (file_exists($marker)) {
+                unlink($marker);
+            }
+        }
+    }
 }

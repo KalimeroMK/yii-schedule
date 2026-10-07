@@ -70,7 +70,7 @@ php yii schedule:work
 The daemon sleeps until the next scheduled run instead of polling on a fixed interval, and
 (with `ext-pcntl`) forks a child process per due task, so tasks sharing a due time run in
 parallel instead of blocking one another. Pass `--sequential` to run due tasks one after
-another as before.
+another as before, or `--max-processes` to cap how many run at once.
 
 A few things to know about the forked mode:
 
@@ -78,11 +78,14 @@ A few things to know about the forked mode:
   listeners receive `null` as the result; a failure is reported as the child's exit status;
 - a child inherits the parent's open connections and sockets, so a task that talks to a
   database or similar should acquire its own connection rather than reuse one opened before
-  the fork — or push the work to the queue, which is fast enough to do in the parent. The
-  child's exit runs the destructors of everything the fork copied, so a handler should not
-  leave the teardown of a shared resource to PHP's shutdown either;
+  the fork — or push the work to the queue, which is fast enough to do in the parent. To keep
+  the parent's own resources out of it, the child does not go through PHP's shutdown at all:
+  no destructors, no `register_shutdown_function` callbacks, its own included, so a task that
+  needs to clean up after itself should do so before it returns;
 - a task whose previous run is still going is skipped instead of being started a second time,
-  so one that takes longer than its own interval cannot pile up a process per due time;
+  so one that takes longer than its own interval cannot pile up a process per due time.
+  `--max-processes` caps the total as well: once that many are running, the next due task
+  waits for a slot instead of being started alongside them;
 - stopping the daemon asks the running tasks to stop with `SIGTERM` and waits five seconds for
   them before resorting to `SIGKILL`. That needs `ext-posix`; without it they are left running,
   to finish on their own.

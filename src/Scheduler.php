@@ -24,8 +24,10 @@ use function array_map;
 use function count;
 use function extension_loaded;
 use function function_exists;
+use function flush;
 use function hrtime;
 use function in_array;
+use function is_executable;
 use function max;
 use function min;
 use function ob_end_clean;
@@ -57,6 +59,12 @@ final class Scheduler
      * How long a shutdown waits for the children to stop before it resorts to SIGKILL.
      */
     private const TERMINATION_TIMEOUT_SECONDS = 5;
+
+    /**
+     * What a finished child hands the process image over to, so PHP's shutdown never runs on
+     * the parent's resources. Required by POSIX to be at this path.
+     */
+    private const EXIT_SHELL = '/bin/sh';
 
     /**
      * The longest the loop sleeps in one go while children are still running. SIGCHLD does
@@ -109,8 +117,11 @@ final class Scheduler
      * the child exit status when the child is reaped, and the PostRunEvent result is null
      * because the outcome cannot cross the process boundary. A task whose previous run is still
      * going is skipped rather than started a second time.
+     * @param int|null $maxProcesses The most task processes to have running at once, null for
+     * no limit. Once that many are running, the next due task waits for one of them to finish
+     * instead of being started alongside them.
      */
-    public function tick(bool $concurrent = false): int
+    public function tick(bool $concurrent = false, ?int $maxProcesses = null): int
     {
         if (!$concurrent || !self::supportsForking()) {
             $count = 0;
@@ -138,8 +149,17 @@ final class Scheduler
         // Draining the generators above already moved every checkpoint past these runs, so a
         // task that fails to start must not abort the ones queued behind it: they would never
         // be emitted again. Collect the first failure and report it once the batch is started.
-        foreach ($due as [$task, $context]) {
+        foreach ($due as $index => [$task, $context]) {
             try {
+                if (!$this->awaitFreeSlot($maxProcesses)) {
+                    $this->logger->warning(
+                        'Stopping, {count} due task(s) of this tick are not started.',
+                        ['count' => count($due) - $index],
+                    );
+
+                    break;
+                }
+
                 $this->forkTask($task, $context);
             } catch (Throwable $error) {
                 $failure ??= $error;
@@ -184,16 +204,18 @@ final class Scheduler
      * @param float $sleepSeconds The fallback sleep when no task has a pending run.
      * @param bool $concurrent Fork a child process per due task (see tick()). Falls back to
      * sequential execution when ext-pcntl is not available.
+     * @param int|null $maxProcesses The most task processes to have running at once (see
+     * tick()), null for no limit.
      *
      * @psalm-suppress RedundantCondition, TypeDoesNotContainType The flag is flipped by stop() from a signal handler.
      */
-    public function run(float $sleepSeconds = 1.0, bool $concurrent = true): void
+    public function run(float $sleepSeconds = 1.0, bool $concurrent = true, ?int $maxProcesses = null): void
     {
         $concurrent = $concurrent && self::supportsForking();
 
         try {
             while (!$this->shouldStop) {
-                $this->tick($concurrent);
+                $this->tick($concurrent, $maxProcesses);
 
                 if ($this->shouldStop) {
                     break;
@@ -462,6 +484,35 @@ final class Scheduler
     }
 
     /**
+     * Waits until fewer than $maxProcesses children are running, collecting the finished ones
+     * while it waits, so a burst of due tasks cannot outgrow the limit.
+     *
+     * @return bool Whether there is room now; false when a stop was requested while waiting.
+     *
+     * @psalm-suppress RedundantCondition The flag is flipped by stop() from a signal handler.
+     */
+    private function awaitFreeSlot(?int $maxProcesses): bool
+    {
+        if (null === $maxProcesses || $maxProcesses < 1) {
+            return true;
+        }
+
+        while (count($this->children) >= $maxProcesses) {
+            if ($this->shouldStop) {
+                return false;
+            }
+
+            $this->reapChildren();
+
+            if (count($this->children) >= $maxProcesses) {
+                usleep(10_000);
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Whether a child started for this very task is still running.
      */
     private function hasRunningChild(TaskContext $context): bool
@@ -480,9 +531,7 @@ final class Scheduler
      * error cannot cross to the parent, so it is logged here, next to where it happened.
      *
      * Note the child shares the parent's open sockets and connections; handlers meant for the
-     * daemon should acquire their own instead of reusing ones opened before the fork. For the
-     * same reason the exit below runs the destructors of everything the fork copied, so a
-     * handler should not leave the teardown of a shared resource to PHP's shutdown.
+     * daemon should acquire their own instead of reusing ones opened before the fork.
      */
     private function runChild(RecurringTask $task, TaskContext $context): never
     {
@@ -509,10 +558,31 @@ final class Scheduler
                 ['id' => $context->taskId, 'schedule' => $context->scheduleName, 'error' => $error->getMessage()],
             );
 
-            exit(1);
+            self::exitChild(1);
         }
 
-        exit(0);
+        self::exitChild(0);
+    }
+
+    /**
+     * Ends the child without PHP's shutdown sequence, which would otherwise run over
+     * everything the fork copied: the destructor of a connection the parent is still using
+     * would say goodbye on its behalf, and shutdown functions registered before the fork
+     * would run a second time. Handing the process image to a shell that does nothing but
+     * exit skips all of it and still reports the outcome through the exit status.
+     *
+     * Falls back to a plain exit where that is not possible; the stream writes made up to
+     * here are not buffered by PHP, so neither path loses them.
+     */
+    private static function exitChild(int $code): never
+    {
+        flush();
+
+        if (function_exists('pcntl_exec') && is_executable(self::EXIT_SHELL)) {
+            pcntl_exec(self::EXIT_SHELL, ['-c', 'exit ' . $code]);
+        }
+
+        exit($code);
     }
 
     /**

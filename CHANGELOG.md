@@ -9,6 +9,8 @@
 - Bug #3: Keep starting the remaining due tasks when one of them fails to start, instead of dropping their already checkpointed runs (@KalimeroMK)
 - Bug #3: Keep a failing task from unwinding the `schedule:work` loop out of its `SIGCHLD` handler, stranding the other task processes (@KalimeroMK)
 - Bug #3: Fix the shutdown of `schedule:work` hanging without `ext-posix` (@KalimeroMK)
+- Bug #3: Skip PHP's shutdown sequence in a forked task, so it no longer runs destructors and shutdown functions over what it inherited from the scheduler (@KalimeroMK)
+- New #3: Add a `--max-processes` option to `schedule:work`, capping how many task processes run at once (@KalimeroMK)
 - Enh #3: Skip a due run of a task whose previous run is still going, instead of starting a second process for it (@KalimeroMK)
 - Enh #3: Collect finished task processes during a long sleep as well, not only when a signal interrupts it (@KalimeroMK)
 - New #2: Run due tasks of `schedule:work` concurrently, forking a child process per task when ext-pcntl is available, with a `--sequential` opt-out (@KalimeroMK)
