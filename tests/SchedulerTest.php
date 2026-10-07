@@ -20,6 +20,16 @@ use Yiisoft\Schedule\Exception\LogicException;
 use Yiisoft\Schedule\Tests\Support\InMemoryMutex;
 use RuntimeException;
 
+use function sprintf;
+
+use const FILE_APPEND;
+use const FILE_IGNORE_NEW_LINES;
+use const FILE_SKIP_EMPTY_LINES;
+use const LOCK_EX;
+use const SIGKILL;
+use const SIGTERM;
+use const SIG_DFL;
+
 final class SchedulerTest extends TestCase
 {
     public function testDueTaskRuns(): void
@@ -709,6 +719,138 @@ final class SchedulerTest extends TestCase
         while ($scheduler->hasRunningChildren()) {
             $scheduler->reapChildren();
             usleep(10_000);
+        }
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testConcurrentTickSkipsATaskWhosePreviousRunIsStillRunning(): void
+    {
+        $clock = new TestClock();
+        $dir = sys_get_temp_dir() . '/yii-schedule-test-' . uniqid();
+        mkdir($dir);
+
+        // Runs until released, so the second due time arrives while the first run is still on.
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use ($dir): void {
+                file_put_contents("$dir/runs", getmypid() . "\n", FILE_APPEND | LOCK_EX);
+
+                $deadline = microtime(true) + 10;
+
+                while (!file_exists("$dir/release") && microtime(true) < $deadline) {
+                    usleep(10_000);
+                }
+            }),
+        );
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock);
+
+        try {
+            $scheduler->tick();
+            $clock->advance('+1 minute');
+            $scheduler->tick(true);
+
+            // The first child has to be up, or the second tick would have nothing to skip.
+            $deadline = microtime(true) + 10;
+            while (!file_exists("$dir/runs") && microtime(true) < $deadline) {
+                usleep(10_000);
+            }
+
+            $clock->advance('+1 minute');
+            $scheduler->tick(true);
+
+            file_put_contents("$dir/release", '1');
+
+            $deadline = microtime(true) + 15;
+            while ($scheduler->hasRunningChildren() && microtime(true) < $deadline) {
+                $scheduler->reapChildren();
+                usleep(10_000);
+            }
+
+            $this->assertFalse($scheduler->hasRunningChildren());
+            $this->assertCount(1, file("$dir/runs", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []);
+        } finally {
+            array_map('unlink', glob("$dir/*") ?: []);
+            rmdir($dir);
+        }
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    #[RequiresPhpExtension('posix')]
+    public function testForkedTaskDoesNotInheritTheParentsSignalHandlers(): void
+    {
+        $clock = new TestClock();
+        $dir = sys_get_temp_dir() . '/yii-schedule-test-' . uniqid();
+        mkdir($dir);
+
+        $schedule = (new Schedule())->task(
+            RecurringTask::cron('* * * * *', static function () use ($dir): void {
+                file_put_contents("$dir/pid", (string) getmypid());
+
+                $deadline = microtime(true) + 15;
+
+                while (microtime(true) < $deadline) {
+                    usleep(10_000);
+                }
+            }),
+        );
+
+        $dispatcher = new class implements EventDispatcherInterface {
+            public array $failures = [];
+
+            public function dispatch(object $event): object
+            {
+                if ($event instanceof FailureEvent) {
+                    $this->failures[] = $event->error->getMessage();
+                    $event->ignore();
+                }
+
+                return $event;
+            }
+        };
+
+        $scheduler = new Scheduler([$schedule], new CallableTaskHandler(), $clock, $dispatcher);
+
+        // The daemon handles SIGTERM itself; forked without a reset, the child would inherit
+        // that handler and quietly ignore the stop request a shutdown sends it.
+        $asyncSignals = pcntl_async_signals();
+        pcntl_async_signals(true);
+        pcntl_signal(SIGTERM, static fn(): null => null);
+
+        try {
+            $scheduler->tick();
+            $clock->advance('+1 minute');
+            $scheduler->tick(true);
+
+            $deadline = microtime(true) + 10;
+            while (!file_exists("$dir/pid") && microtime(true) < $deadline) {
+                usleep(10_000);
+            }
+
+            $pid = (int) file_get_contents("$dir/pid");
+            $this->assertNotSame(0, $pid);
+
+            posix_kill($pid, SIGTERM);
+
+            $deadline = microtime(true) + 10;
+            while ($scheduler->hasRunningChildren() && microtime(true) < $deadline) {
+                $scheduler->reapChildren();
+                usleep(10_000);
+            }
+
+            if ($scheduler->hasRunningChildren()) {
+                posix_kill($pid, SIGKILL);
+                $this->fail('The forked task ignored SIGTERM.');
+            }
+
+            $this->assertSame(
+                [sprintf('The task process was terminated by signal %d.', SIGTERM)],
+                $dispatcher->failures,
+            );
+        } finally {
+            pcntl_signal(SIGTERM, SIG_DFL);
+            pcntl_async_signals($asyncSignals);
+            array_map('unlink', glob("$dir/*") ?: []);
+            rmdir($dir);
         }
     }
 }

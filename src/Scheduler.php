@@ -25,13 +25,22 @@ use function count;
 use function extension_loaded;
 use function function_exists;
 use function hrtime;
+use function in_array;
 use function max;
+use function min;
+use function ob_end_clean;
+use function ob_get_level;
 use function sprintf;
 use function time_nanosleep;
 use function usleep;
 
+use const SIGCHLD;
+use const SIGINT;
 use const SIGKILL;
 use const SIGTERM;
+use const SIG_BLOCK;
+use const SIG_DFL;
+use const SIG_UNBLOCK;
 use const WNOHANG;
 
 /**
@@ -44,11 +53,24 @@ use const WNOHANG;
  */
 final class Scheduler
 {
+    /**
+     * How long a shutdown waits for the children to stop before it resorts to SIGKILL.
+     */
+    private const TERMINATION_TIMEOUT_SECONDS = 5;
+
+    /**
+     * The longest the loop sleeps in one go while children are still running. SIGCHLD does
+     * not interrupt the sleep unless a handler is registered for it, so with a far-away next
+     * run the loop has to come back by itself to collect the finished ones.
+     */
+    private const CHILD_POLL_SECONDS = 0.5;
+
     /** @var array<string, TaskGenerator> */
     private array $generators = [];
     private bool $shouldStop = false;
     /** @var array<int, array{RecurringTask, TaskContext}> Child process id to its task and context. */
     private array $children = [];
+    private bool $terminating = false;
     private readonly LoggerInterface $logger;
 
     /**
@@ -85,7 +107,8 @@ final class Scheduler
      * run in parallel instead of blocking one another. Requires ext-pcntl; without it the tasks
      * run one after another as before. A task failure then surfaces as a RuntimeException about
      * the child exit status when the child is reaped, and the PostRunEvent result is null
-     * because the outcome cannot cross the process boundary.
+     * because the outcome cannot cross the process boundary. A task whose previous run is still
+     * going is skipped rather than started a second time.
      */
     public function tick(bool $concurrent = false): int
     {
@@ -110,8 +133,21 @@ final class Scheduler
             }
         }
 
+        $failure = null;
+
+        // Draining the generators above already moved every checkpoint past these runs, so a
+        // task that fails to start must not abort the ones queued behind it: they would never
+        // be emitted again. Collect the first failure and report it once the batch is started.
         foreach ($due as [$task, $context]) {
-            $this->forkTask($task, $context);
+            try {
+                $this->forkTask($task, $context);
+            } catch (Throwable $error) {
+                $failure ??= $error;
+            }
+        }
+
+        if (null !== $failure) {
+            throw $failure;
         }
 
         return count($due);
@@ -186,18 +222,27 @@ final class Scheduler
      * failure event. Safe to call from a SIGCHLD handler; does nothing without ext-pcntl.
      *
      * A failure that no listener ignored is thrown once the whole batch is reaped, so one
-     * broken task neither kills its siblings nor goes silently unnoticed.
+     * broken task neither kills its siblings nor goes silently unnoticed. Called from a
+     * signal handler, that throw lands wherever the main loop happens to be, so the handler
+     * should catch it and let the loop finish instead of unwinding it from there.
      */
     public function reapChildren(): void
     {
-        if ([] === $this->children || !self::supportsForking()) {
+        if ([] === $this->children || $this->terminating || !self::supportsForking()) {
             return;
         }
 
         $failure = null;
 
-        while (($pid = pcntl_wait($status, WNOHANG)) > 0) {
+        // Only the processes we started: pcntl_wait() would also consume the exit status of a
+        // child the host application forked, leaving its owner unable to collect it.
+        foreach (array_keys($this->children) as $pid) {
+            // A SIGCHLD handler may have re-entered this method and taken the entry already.
             if (!array_key_exists($pid, $this->children)) {
+                continue;
+            }
+
+            if ($pid !== pcntl_waitpid($pid, $status, WNOHANG)) {
                 continue;
             }
 
@@ -270,13 +315,37 @@ final class Scheduler
                 break;
             }
 
-            $wholeSeconds = (int) $remaining;
-            $nanoseconds = (int) (($remaining - $wholeSeconds) * 1_000_000_000);
+            // Without a SIGCHLD handler the signal is ignored and does not interrupt the
+            // sleep, so a long idle stretch would leave finished tasks unreaped - and their
+            // events undispatched - for its whole length.
+            if ([] !== $this->children) {
+                $remaining = min($remaining, self::CHILD_POLL_SECONDS);
+            }
 
-            time_nanosleep($wholeSeconds, $nanoseconds);
+            self::waitFor($remaining);
 
             $this->reapChildren();
         }
+    }
+
+    /**
+     * Sleeps for the given seconds, returning early when a signal interrupts the wait.
+     *
+     * time_nanosleep() is only compiled in where nanosleep() exists, so Windows needs the
+     * coarser usleep() - which is no loss there, as it has no signals to wake up for either.
+     */
+    private static function waitFor(float $seconds): void
+    {
+        if (function_exists('time_nanosleep')) {
+            $wholeSeconds = (int) $seconds;
+            $nanoseconds = (int) (($seconds - $wholeSeconds) * 1_000_000_000);
+
+            time_nanosleep($wholeSeconds, $nanoseconds);
+
+            return;
+        }
+
+        usleep((int) ($seconds * 1_000_000));
     }
 
     private function runTask(RecurringTask $task, TaskContext $context): void
@@ -352,24 +421,58 @@ final class Scheduler
      */
     private function forkTask(RecurringTask $task, TaskContext $context): void
     {
+        // One process per task at a time: a task that takes longer than its own interval
+        // would otherwise pile up a process per due time and never catch up.
+        if ($this->hasRunningChild($context)) {
+            $this->logger->warning(
+                'Task {id} of schedule {schedule} is still running, skipping this run.',
+                ['id' => $context->taskId, 'schedule' => $context->scheduleName],
+            );
+
+            return;
+        }
+
         if (!$this->beforeRun($task, $context)) {
             return;
         }
 
+        // SIGCHLD must not arrive between the fork and the line recording the pid: the
+        // handler would reap a child it does not know about yet and drop its outcome, and
+        // the entry written afterwards would then be waited on forever.
+        $blocked = self::blockChildSignal();
+
         $pid = pcntl_fork();
 
+        if (0 === $pid) {
+            $this->runChild($task, $context);
+        }
+
         if (-1 === $pid) {
+            self::unblockChildSignal($blocked);
+
             // Forking is refused (e.g. resource limits): run inline rather than drop the run.
             $this->executeTask($task, $context);
 
             return;
         }
 
-        if (0 === $pid) {
-            $this->runChild($task, $context);
+        $this->children[$pid] = [$task, $context];
+
+        self::unblockChildSignal($blocked);
+    }
+
+    /**
+     * Whether a child started for this very task is still running.
+     */
+    private function hasRunningChild(TaskContext $context): bool
+    {
+        foreach ($this->children as [, $running]) {
+            if ($running->scheduleName === $context->scheduleName && $running->taskId === $context->taskId) {
+                return true;
+            }
         }
 
-        $this->children[$pid] = [$task, $context];
+        return false;
     }
 
     /**
@@ -377,10 +480,27 @@ final class Scheduler
      * error cannot cross to the parent, so it is logged here, next to where it happened.
      *
      * Note the child shares the parent's open sockets and connections; handlers meant for the
-     * daemon should acquire their own instead of reusing ones opened before the fork.
+     * daemon should acquire their own instead of reusing ones opened before the fork. For the
+     * same reason the exit below runs the destructors of everything the fork copied, so a
+     * handler should not leave the teardown of a shared resource to PHP's shutdown.
      */
     private function runChild(RecurringTask $task, TaskContext $context): never
     {
+        // The fork copied the parent's bookkeeping along with its signal handlers. Left as
+        // they are, the inherited SIGCHLD handler would reap the subprocesses the task itself
+        // starts, and the inherited SIGTERM handler would swallow the stop request a shutdown
+        // sends, leaving SIGKILL as the only way to end this process.
+        $this->children = [];
+        $this->terminating = false;
+        self::restoreDefaultSignalHandlers();
+
+        // Whatever the parent had buffered before the fork belongs to the parent, which
+        // writes it out itself; releasing the buffers here also keeps the task's own output
+        // from piling up in a buffer nothing will ever flush.
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
         try {
             $this->handler->handle($task->getTask(), $context);
         } catch (Throwable $error) {
@@ -435,9 +555,9 @@ final class Scheduler
     }
 
     /**
-     * On the way out, asks the still-running children to finish and waits for them briefly,
-     * so a reload or deploy does not strand task processes. Their outcomes are not turned
-     * into events: a shutdown is not a task failure.
+     * On the way out, asks the still-running children to stop and waits for them briefly, so
+     * a reload or deploy does not strand task processes. Their outcomes are not turned into
+     * events: a shutdown is not a task failure.
      */
     private function terminateChildren(): void
     {
@@ -445,30 +565,62 @@ final class Scheduler
             return;
         }
 
-        foreach (array_keys($this->children) as $pid) {
-            if (function_exists('posix_kill')) {
-                posix_kill($pid, SIGTERM);
-            }
+        // From here on these children are ours to collect, so a SIGCHLD handler must not
+        // dispatch a failure for one this method is in the middle of stopping. The flag is
+        // dropped again on the way out: run() may well be entered a second time.
+        $this->terminating = true;
+
+        try {
+            $this->stopChildren();
+        } finally {
+            $this->terminating = false;
+        }
+    }
+
+    /**
+     * The shutdown itself: SIGTERM, a grace period, then SIGKILL for whatever is left.
+     */
+    private function stopChildren(): void
+    {
+        if (!function_exists('posix_kill')) {
+            // Without ext-posix there is no way to ask them to stop, and waiting for tasks of
+            // unknown length would hang the shutdown instead of ending it: let them finish on
+            // their own and be reaped by init.
+            $this->logger->warning(
+                'Leaving {count} task process(es) behind: ext-posix is required to stop them.',
+                ['count' => count($this->children)],
+            );
+            $this->children = [];
+
+            return;
         }
 
-        $deadline = hrtime(true) + 5_000_000_000;
+        foreach (array_keys($this->children) as $pid) {
+            posix_kill($pid, SIGTERM);
+        }
 
-        while ([] !== $this->children) {
-            $pid = pcntl_wait($status, WNOHANG);
+        $deadline = hrtime(true) + self::TERMINATION_TIMEOUT_SECONDS * 1_000_000_000;
+        $pending = array_keys($this->children);
 
-            if ($pid > 0) {
-                unset($this->children[$pid]);
-                continue;
+        while (true) {
+            foreach ($pending as $index => $pid) {
+                // Anything but "still running" ends the wait for this one, a vanished child
+                // (-1) included - there is nothing left to collect from it.
+                if (0 !== pcntl_waitpid($pid, $status, WNOHANG)) {
+                    unset($this->children[$pid], $pending[$index]);
+                }
+            }
+
+            if ([] === $pending) {
+                break;
             }
 
             if (hrtime(true) >= $deadline) {
-                if (function_exists('posix_kill')) {
-                    foreach (array_keys($this->children) as $pid) {
-                        posix_kill($pid, SIGKILL);
-                    }
-                }
-
-                while (($pid = pcntl_wait($status)) > 0) {
+                foreach ($pending as $pid) {
+                    posix_kill($pid, SIGKILL);
+                    // Just killed, so this returns at once; a signal interrupting it (-1)
+                    // still ends the wait rather than looping on a process that is gone.
+                    pcntl_waitpid($pid, $status);
                     unset($this->children[$pid]);
                 }
 
@@ -476,6 +628,52 @@ final class Scheduler
             }
 
             usleep(10_000);
+        }
+    }
+
+    /**
+     * Keeps SIGCHLD from being delivered until the fork is recorded.
+     *
+     * @return bool Whether it has to be unblocked again, i.e. it was not blocked already.
+     */
+    private static function blockChildSignal(): bool
+    {
+        if (!function_exists('pcntl_sigprocmask')) {
+            return false;
+        }
+
+        $previous = [];
+
+        if (!pcntl_sigprocmask(SIG_BLOCK, [SIGCHLD], $previous)) {
+            return false;
+        }
+
+        return !in_array(SIGCHLD, $previous, true);
+    }
+
+    private static function unblockChildSignal(bool $blocked): void
+    {
+        if ($blocked) {
+            pcntl_sigprocmask(SIG_UNBLOCK, [SIGCHLD]);
+        }
+    }
+
+    /**
+     * Hands a freshly forked child the signal dispositions of a plain process, so the
+     * handlers the daemon installed for itself do not act on its behalf.
+     */
+    private static function restoreDefaultSignalHandlers(): void
+    {
+        if (!function_exists('pcntl_signal')) {
+            return;
+        }
+
+        foreach ([SIGCHLD, SIGTERM, SIGINT] as $signal) {
+            pcntl_signal($signal, SIG_DFL);
+        }
+
+        if (function_exists('pcntl_sigprocmask')) {
+            pcntl_sigprocmask(SIG_UNBLOCK, [SIGCHLD]);
         }
     }
 }

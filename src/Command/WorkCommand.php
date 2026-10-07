@@ -10,6 +10,7 @@ use Symfony\Component\Console\Command\SignalableCommandInterface;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Throwable;
 use Yiisoft\Schedule\Scheduler;
 
 use function extension_loaded;
@@ -30,6 +31,11 @@ use const SIGTERM;
 #[AsCommand('schedule:work', 'Runs the scheduler as a long-running process.')]
 final class WorkCommand extends Command implements SignalableCommandInterface
 {
+    /**
+     * A task failure caught in the signal handler, rethrown once the loop has finished.
+     */
+    private ?Throwable $failure = null;
+
     public function __construct(
         private readonly Scheduler $scheduler,
     ) {
@@ -61,8 +67,16 @@ final class WorkCommand extends Command implements SignalableCommandInterface
     public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
     {
         if (SIGCHLD === $signal) {
-            // A task process finished; collect its outcome without leaving the loop.
-            $this->scheduler->reapChildren();
+            // A task process finished; collect its outcome without leaving the loop. The
+            // handler runs at an arbitrary point of that loop, so a failing task must not
+            // throw from here: it would abort a shutdown halfway through, stranding the
+            // remaining children. Remember it and let the loop end on its own terms.
+            try {
+                $this->scheduler->reapChildren();
+            } catch (Throwable $error) {
+                $this->failure ??= $error;
+                $this->scheduler->stop();
+            }
 
             return false;
         }
@@ -91,6 +105,10 @@ final class WorkCommand extends Command implements SignalableCommandInterface
         $output->writeln('<info>Scheduler started.</info>');
 
         $this->scheduler->run((float) $sleep, !(bool) $input->getOption('sequential'));
+
+        if (null !== $this->failure) {
+            throw $this->failure;
+        }
 
         $output->writeln('<info>Scheduler stopped.</info>');
 

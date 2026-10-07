@@ -72,13 +72,20 @@ The daemon sleeps until the next scheduled run instead of polling on a fixed int
 parallel instead of blocking one another. Pass `--sequential` to run due tasks one after
 another as before.
 
-Two things to know about the forked mode:
+A few things to know about the forked mode:
 
 - a task's return value cannot cross the process boundary, so `PostRunEvent` and the `after`
   listeners receive `null` as the result; a failure is reported as the child's exit status;
 - a child inherits the parent's open connections and sockets, so a task that talks to a
   database or similar should acquire its own connection rather than reuse one opened before
-  the fork — or push the work to the queue, which is fast enough to do in the parent.
+  the fork — or push the work to the queue, which is fast enough to do in the parent. The
+  child's exit runs the destructors of everything the fork copied, so a handler should not
+  leave the teardown of a shared resource to PHP's shutdown either;
+- a task whose previous run is still going is skipped instead of being started a second time,
+  so one that takes longer than its own interval cannot pile up a process per due time;
+- stopping the daemon asks the running tasks to stop with `SIGTERM` and waits five seconds for
+  them before resorting to `SIGKILL`. That needs `ext-posix`; without it they are left running,
+  to finish on their own.
 
 `schedule:run` exits between runs, so a persisted checkpoint is the only way for it to tell
 which runs already happened: it requires a stateful schedule and reports an error without one.

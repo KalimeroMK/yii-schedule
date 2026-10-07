@@ -2,6 +2,15 @@
 
 ## 1.0.0 under development
 
+- Bug #3: Fix `schedule:work` crashing on Windows, where `time_nanosleep()` is not available (@KalimeroMK)
+- Bug #3: Fix a `SIGCHLD` arriving between the fork and the bookkeeping leaving a task process uncollected (@KalimeroMK)
+- Bug #3: Reset the inherited signal handlers in a forked task, so it stops on `SIGTERM` instead of ignoring it and no longer reaps the subprocesses it starts itself (@KalimeroMK)
+- Bug #3: Wait only on the scheduler's own child processes, leaving those of the host application to their owner (@KalimeroMK)
+- Bug #3: Keep starting the remaining due tasks when one of them fails to start, instead of dropping their already checkpointed runs (@KalimeroMK)
+- Bug #3: Keep a failing task from unwinding the `schedule:work` loop out of its `SIGCHLD` handler, stranding the other task processes (@KalimeroMK)
+- Bug #3: Fix the shutdown of `schedule:work` hanging without `ext-posix` (@KalimeroMK)
+- Enh #3: Skip a due run of a task whose previous run is still going, instead of starting a second process for it (@KalimeroMK)
+- Enh #3: Collect finished task processes during a long sleep as well, not only when a signal interrupts it (@KalimeroMK)
 - New #2: Run due tasks of `schedule:work` concurrently, forking a child process per task when ext-pcntl is available, with a `--sequential` opt-out (@KalimeroMK)
 - Enh #2: Sleep until the next scheduled run in `schedule:work` instead of polling every second (@KalimeroMK)
 - New #1: Add scheduling core: triggers (cron, periodic, callback), schedules with mutex and stateful checkpoints, missed-run catch-up, and `schedule:run`, `schedule:work` and `schedule:list` commands (@KalimeroMK)
