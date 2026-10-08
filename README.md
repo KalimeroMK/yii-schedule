@@ -108,6 +108,26 @@ $schedule = (new Schedule())
     ->task(...);
 ```
 
+## Running on multiple servers
+
+The same setup scales horizontally without a single point of failure: put the `schedule:run`
+cron entry (or the `schedule:work` daemon) on every application server. Two things then need
+to be shared between the servers:
+
+- the mutex needs a shared driver — [yiisoft/mutex-redis](https://github.com/yiisoft/mutex-redis),
+  [yiisoft/mutex-pdo-mysql](https://github.com/yiisoft/mutex-pdo-mysql) or
+  [yiisoft/mutex-pdo-pgsql](https://github.com/yiisoft/mutex-pdo-pgsql) — so that the first
+  server acquiring it runs the due tasks while the others skip the tick silently;
+- the checkpoint cache needs a shared PSR-16 pool — for example
+  [yiisoft/cache-redis](https://github.com/yiisoft/cache-redis) — so that every server sees
+  which runs already happened, and one resuming after downtime compensates only the runs
+  nobody covered instead of re-running them.
+
+The bundled configuration wires the checkpoint cache automatically as soon as the application
+has a PSR-16 cache; the mutex is opt-in — add `->lock($mutex)` as shown above. With both in
+place, a task is still executed exactly once no matter how many servers the schedule runs on,
+and no single server going down stops the schedule.
+
 ## Documentation
 
 - [Internals](docs/internals.md)
